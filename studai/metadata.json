@@ -1,0 +1,6 @@
+{
+  "name": "StudAI",
+  "description": "Adaptive AI academic execution and learning agent for university students that automates mechanical work while protecting high-value cognitive learning.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
