@@ -1,7 +1,7 @@
 import express from 'express';
 import path from 'path';
 import dotenv from 'dotenv';
-import { GoogleGenAI } from '@google/genai';
+import { generateGroqJSON, isGroqConfigured, GROQ_MODEL } from './server/groq.ts';
 
 dotenv.config();
 
@@ -10,34 +10,19 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: '10mb' }));
 
-// Lazy initialize Gemini API client to prevent crashes if key is absent
-let aiClient: GoogleGenAI | null = null;
-function getAIClient(): GoogleGenAI | null {
-  if (aiClient) return aiClient;
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return null;
-  try {
-    aiClient = new GoogleGenAI({ apiKey });
-    return aiClient;
-  } catch (err) {
-    console.warn('Failed to initialize GoogleGenAI client:', err);
-    return null;
-  }
-}
-
 // 1. Health check
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    aiAvailable: !!process.env.GEMINI_API_KEY,
-    model: 'gemini-3.8-flash',
+    provider: 'groq',
+    aiAvailable: isGroqConfigured(),
+    model: GROQ_MODEL,
   });
 });
 
 // 2. Task / Document Analysis Endpoint
 app.post('/api/analyze-task', async (req, res) => {
   const { title, course, prompt, instructions, deadline, studentProfile } = req.body || {};
-  const ai = getAIClient();
 
   const explicitProfileSummary = studentProfile
     ? `
@@ -58,7 +43,7 @@ STUDYOS INFERRED INSIGHTS (ACTIVITY PATTERNS):
 - Common Friction Points: ${(studentProfile.commonFrictionPoints || []).join('; ') || 'None recorded'}`
     : '';
 
-  if (ai) {
+  if (isGroqConfigured()) {
     try {
       const systemInstruction = `You are StudAI's Academic Task & Learning Objectives Analyzer.
 Your core philosophy is: "AI should automate low-learning-value work while protecting high-learning-value work."
@@ -105,30 +90,24 @@ Respond ONLY with valid JSON matching this exact structure:
   "modeRecommendationReason": "string"
 }`;
 
-      const userMessage = `Analyze this university task:
+      const userPrompt = `Analyze this university task:
 Course: ${course || 'General'}
 Title: ${title || 'Academic Task'}
 Deadline: ${deadline || 'Flexible'}
 Raw Task / Description: ${prompt}
 Additional Instructions: ${instructions || 'None provided'}`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
-        contents: userMessage,
-        config: {
-          systemInstruction,
-          responseMimeType: 'application/json',
-          temperature: 0.2,
-        },
+      const parsed = await generateGroqJSON<any>({
+        systemInstruction,
+        userPrompt,
+        temperature: 0.2,
       });
 
-      const text = response.text?.trim();
-      if (text) {
-        const parsed = JSON.parse(text);
-        return res.json({ success: true, data: parsed, source: 'gemini' });
+      if (parsed && typeof parsed === 'object' && parsed.projectTitle) {
+        return res.json({ success: true, data: parsed, source: 'groq' });
       }
     } catch (err) {
-      console.warn('Gemini analysis error, using intelligent domain fallback:', err);
+      console.warn('Groq analysis error, using intelligent domain fallback:', err);
     }
   }
 
@@ -140,12 +119,11 @@ Additional Instructions: ${instructions || 'None provided'}`;
 // 3. Mission Generation Endpoint
 app.post('/api/generate-missions', async (req, res) => {
   const { analysis, selectedMode, studentProfile } = req.body || {};
-  const ai = getAIClient();
 
   const targetMinutes = studentProfile?.preferredSessionLengthMinutes || 15;
   const learningStyle = studentProfile?.preferredLearningStyle || 'Practice questions';
 
-  if (ai && analysis) {
+  if (isGroqConfigured() && analysis) {
     try {
       const systemInstruction = `You are StudAI's Mission & Execution Plan Generator.
 Given a project analysis and the selected assistance mode (${selectedMode || 'BALANCED'}), generate a sequence of 5 to 7 concrete, bite-sized academic missions that respect the mode.
@@ -185,23 +163,19 @@ Return ONLY valid JSON matching this exact structure:
   ]
 }`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
-        contents: `Project: ${analysis.projectTitle}\nTask: ${analysis.whatToAccomplish}\nSelected Mode: ${selectedMode}\nComponents: ${JSON.stringify(analysis.components)}`,
-        config: {
-          systemInstruction,
-          responseMimeType: 'application/json',
-          temperature: 0.2,
-        },
+      const userPrompt = `Project: ${analysis.projectTitle}\nTask: ${analysis.whatToAccomplish}\nSelected Mode: ${selectedMode}\nComponents: ${JSON.stringify(analysis.components)}`;
+
+      const parsed = await generateGroqJSON<{ missions: any[] }>({
+        systemInstruction,
+        userPrompt,
+        temperature: 0.2,
       });
 
-      const text = response.text?.trim();
-      if (text) {
-        const parsed = JSON.parse(text);
-        return res.json({ success: true, missions: parsed.missions, source: 'gemini' });
+      if (parsed && Array.isArray(parsed.missions) && parsed.missions.length > 0) {
+        return res.json({ success: true, missions: parsed.missions, source: 'groq' });
       }
     } catch (err) {
-      console.warn('Gemini mission generation error, using fallback:', err);
+      console.warn('Groq mission generation error, using fallback:', err);
     }
   }
 
@@ -212,9 +186,8 @@ Return ONLY valid JSON matching this exact structure:
 // 4. Study Coach & Academic Integrity Guardrail Endpoint
 app.post('/api/coach', async (req, res) => {
   const { query, project, currentMission, mode, studentProfile } = req.body || {};
-  const ai = getAIClient();
 
-  if (ai) {
+  if (isGroqConfigured()) {
     try {
       const studentContext = studentProfile ? `
 STUDENT EXPLICIT PREFERENCES (HIGH PRIORITY):
@@ -236,7 +209,7 @@ COACHING ADAPTATION:
   * If "Practice questions", prioritize quiz / retrieval checks.
   * If "Explanations", prioritize clear causal breakdowns.
   * If "Visual learning", prioritize matrices, markdown tables, or step diagrams.
-- If the student is feeling stuck or overwhelmed, acknowledge their triggers (${(studentProfile.procrastinationTriggers || []).join(', ')}) and prescribe a tiny action matching their preferred session length (${studentProfile.preferredSessionLengthMinutes || 15} min).` : '';
+- If the student is feeling stuck or overwhelmed, acknowledge their triggers (${(studentProfile?.procrastinationTriggers || []).join(', ')}) and prescribe a tiny action matching their preferred session length (${studentProfile?.preferredSessionLengthMinutes || 15} min).` : '';
 
       const systemInstruction = `You are StudAI's Adaptive Study Coach and Academic Execution Agent for university students.
 Current Coach Mode: ${mode || 'COACHING'}
@@ -279,23 +252,19 @@ FORMAT RESPONSE AS JSON:
   }
 }`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
-        contents: `Student Query: ${query}`,
-        config: {
-          systemInstruction,
-          responseMimeType: 'application/json',
-          temperature: 0.3,
-        },
+      const userPrompt = `Student Query: ${query}`;
+
+      const parsed = await generateGroqJSON<any>({
+        systemInstruction,
+        userPrompt,
+        temperature: 0.3,
       });
 
-      const text = response.text?.trim();
-      if (text) {
-        const parsed = JSON.parse(text);
-        return res.json({ success: true, data: parsed, source: 'gemini' });
+      if (parsed && typeof parsed === 'object' && parsed.text) {
+        return res.json({ success: true, data: parsed, source: 'groq' });
       }
     } catch (err) {
-      console.warn('Gemini coach error, using fallback:', err);
+      console.warn('Groq coach error, using fallback:', err);
     }
   }
 
